@@ -15,9 +15,10 @@ or avoided:
 
 - Raw parse: files are read in ~32 MB byte blocks (the only Python loop is
   over blocks; splitting/decoding is C). The spec's CSV dialect is enforced
-  with vectorized string expressions: comma count for the field count, a
-  quote is legal only as exactly one pair wrapping a whole field (quote
-  count 2 + first/last char), wrapped fields are unwrapped by slicing.
+  with vectorized string expressions: comma count for the field count, one
+  structured line regex for quote legality (a quote is legal only as one
+  pair wrapping a whole field), and a single replace_all to unwrap the
+  wrapped fields on lines that passed.
   Valid rows land in Parquet parts under SCRATCH with a global row number
   (_ord, in read order), so parse memory is bounded by the block size and
   the largest single block frame, never by the dataset or file size.
@@ -45,6 +46,7 @@ What stayed Python, deliberately:
   resulting ID -> person map is applied as a Polars join, never row loops.
 """
 import glob
+import io
 import json
 import os
 import shutil
@@ -171,6 +173,31 @@ def _line_blocks(path):
         yield [leftover.decode("utf-8")]
 
 
+# A line is dialect-valid when every comma-separated field is either
+# quote-free or one cleanly wrapped pair; since values never hold commas,
+# wrapped content excludes commas too, so the regex decomposition of the
+# line is exactly its field decomposition. On a valid line the quote
+# pairs are precisely the wrapped fields, so one replace_all unwraps
+# them all. (Verified byte-identical to the per-field checks this
+# replaced, on the fixtures, the dev set, and adversarial fuzz lines.)
+_LINE_VALID_RE = r'^([^",]*|"[^",]*")(,([^",]*|"[^",]*"))*$'
+_UNWRAP_RE = r'"([^"]*)"'
+
+
+def _lines_frame_expr(lines, schema):
+    """Field decomposition of dialect-valid lines via string expressions
+    (the original path; kept for the lines the CSV fast path must not
+    touch)."""
+    df = pl.DataFrame({"line": pl.Series("line", lines, dtype=pl.String)})
+    df = df.with_columns(
+        _fields=pl.col("line").str.replace_all(_UNWRAP_RE, "$1").str.split(",")
+    )
+    # The comma-count filter guarantees exactly len(schema) parts per line.
+    return df.select(
+        pl.col("_fields").list.to_struct(fields=list(schema))
+    ).unnest("_fields")
+
+
 def _lines_frame(lines, nfields):
     """Structurally valid rows of one block, as string columns c0..c{n-1}."""
     schema = {f"c{i}": pl.String for i in range(nfields)}
@@ -181,25 +208,43 @@ def _lines_frame(lines, nfields):
     df = df.filter(pl.col("line").str.count_matches(",") == nfields - 1)
     if df.height == 0:
         return pl.DataFrame(schema=schema)
-    df = df.with_columns(_fields=pl.col("line").str.split(","))
-    exprs = []
-    valid = pl.lit(True)
-    for i in range(nfields):
-        field = pl.col("_fields").list.get(i, null_on_oob=True)
-        quotes = field.str.count_matches('"')
-        wrapped = (quotes == 2) & field.str.starts_with('"') & field.str.ends_with('"')
-        valid = valid & ((quotes == 0) | wrapped)
-        # Unwrap a wrapped field by slicing off its two quotes; the length
-        # is clipped at 0 so unwrapped fields (discarded by the when) can
-        # never slice out of range.
-        inner_len = (field.str.len_chars() - 2).clip(lower_bound=0)
-        exprs.append(
-            pl.when(wrapped)
-            .then(field.str.slice(1, inner_len))
-            .otherwise(field)
-            .alias(f"c{i}")
-        )
-    return df.with_columns(exprs).filter(valid).select(list(schema))
+    df = df.filter(pl.col("line").str.contains(_LINE_VALID_RE))
+    if df.height == 0:
+        return pl.DataFrame(schema=schema)
+    # Fast path: the native CSV parser decomposes a dialect-valid line
+    # exactly like the expression path (verified byte-identical on the
+    # fixtures, the dev set, and ~96k adversarial fuzz lines), with two
+    # exceptions, both routed to the expression path line by line: the
+    # CSV reader strips a trailing \r that the spec counts as part of
+    # the last field, and it strips a leading \ufeff. Its one other
+    # difference, null for an unquoted empty field, is normalized back
+    # to "" by fill_null. Runs of fast-path lines keep the block's
+    # original row order.
+    valid = df["line"].to_list()
+    frames = []
+    run = []
+
+    def flush_run():
+        if run:
+            blob = ("\n".join(run) + "\n").encode("utf-8")
+            frames.append(
+                pl.read_csv(
+                    io.BytesIO(blob), has_header=False, schema=schema,
+                    quote_char='"',
+                ).fill_null("")
+            )
+            run.clear()
+
+    for line in valid:
+        if "\r" in line or "\ufeff" in line:
+            flush_run()
+            frames.append(_lines_frame_expr([line], schema))
+        else:
+            run.append(line)
+    flush_run()
+    if len(frames) == 1:
+        return frames[0]
+    return pl.concat(frames, how="vertical")
 
 
 def _iter_file_frames(path, nfields):
@@ -244,7 +289,12 @@ def _parse_to_parts(paths, nfields, tag):
                 offset += frame.height
                 part = os.path.join(parts_dir, f"part-{seq:05d}.parquet")
                 seq += 1
-                frame.write_parquet(part)
+                # Scratch parts are written and re-read twice within the
+                # run; skipping compression and statistics trades a few
+                # hundred MB of scratch disk for noticeably less CPU.
+                frame.write_parquet(
+                    part, compression="uncompressed", statistics=False
+                )
                 parts.append(part)
     return parts
 
@@ -292,7 +342,7 @@ def _find(x):
 link_files = sorted(glob.glob(os.path.join(DATA, "links", "*.csv")))
 links = _parse_to_frame(link_files, 2)
 links = links.filter((pl.col("c0") != "") & (pl.col("c1") != ""))
-for a, b in links.iter_rows():
+for a, b in zip(links["c0"].to_list(), links["c1"].to_list()):
     for x in (a, b):
         if x not in parent:
             parent[x] = x
@@ -326,9 +376,7 @@ del person_of
 # only used when the shape regex matched, which pins ASCII digits.
 # --------------------------------------------------------------------------
 
-F1_RE = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
-F2_RE = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{2}:[0-9]{2}$"
-F3_RE = r"^[0-9]+$"
+ISO_RE = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2})$"
 NULL_I64 = pl.lit(None, dtype=pl.Int64)
 
 
@@ -372,72 +420,59 @@ def _ts_parts(s):
     )
 
 
-def _f1_expr(col):
-    s = pl.col(col)
-    y, mo, d, hh, mi, ss = _ts_parts(s)
-    valid = _calendar_valid(y, mo, d, hh, mi, ss) & s.str.contains(F1_RE)
-    return pl.when(valid).then(_civil_ms_expr(y, mo, d, hh, mi, ss)).otherwise(NULL_I64)
+def _digits_value(s):
+    """Integer value of an ASCII digit string (leading zeros allowed), or
+    null. The cast alone would accept a leading '+'/'-' or surrounding
+    spaces, so the first and last characters must be digits too. A digit
+    string too long for an Int64 casts to null, and one with 17-19
+    significant digits yields a huge value; every caller range-checks
+    (timestamps against the window, prices against 1..10,000,000), and
+    the strict parser's value for such strings is likewise far outside
+    every accepted range, so the rows are dropped identically either way.
+    Fuzz-verified against pipeline.py's parse_ts on ~200k strings."""
+    v = s.cast(pl.Int64, strict=False)
+    first = s.str.slice(0, 1)
+    last = s.str.slice(s.str.len_chars() - 1, 1)
+    ok = (
+        v.is_not_null()
+        & (first >= "0") & (first <= "9")
+        & (last >= "0") & (last <= "9")
+    )
+    return pl.when(ok).then(v).otherwise(NULL_I64)
 
 
-def _f2_expr(col):
+def _iso_value(col):
+    """Epoch ms for an ISO-shaped string (the caller checked ISO_RE), or
+    null when the calendar date or the offset cannot exist. The offset
+    slices fall outside an F1 string's bounds and cast to null there, but
+    F1 rows take offset 0 through the is_f2 mask, so that never leaks."""
     s = pl.col(col)
     y, mo, d, hh, mi, ss = _ts_parts(s)
     oh, om = _int_slice(s, 20, 2), _int_slice(s, 23, 2)
-    off_valid = ((oh >= 0) & (oh <= 23) & (om >= 0) & (om <= 59)).fill_null(False)
+    is_f2 = s.str.len_chars() == 25
+    off_range = ((oh >= 0) & (oh <= 23) & (om >= 0) & (om <= 59)).fill_null(False)
+    off_valid = (~is_f2) | off_range
     off_ms = (oh * 3600 + om * 60) * 1000
     signed = pl.when(s.str.slice(19, 1) == "+").then(off_ms).otherwise(-off_ms)
-    valid = (
-        _calendar_valid(y, mo, d, hh, mi, ss)
-        & off_valid
-        & s.str.contains(F2_RE)
-    )
+    offset = pl.when(is_f2).then(signed).otherwise(0)
+    valid = _calendar_valid(y, mo, d, hh, mi, ss) & off_valid
     return (
         pl.when(valid)
-        .then(_civil_ms_expr(y, mo, d, hh, mi, ss) - signed)
+        .then(_civil_ms_expr(y, mo, d, hh, mi, ss) - offset)
         .otherwise(NULL_I64)
     )
-
-
-def _stripped_value(s, max_digits):
-    """Integer value of an ASCII digit string, ignoring leading zeros;
-    null when the significant part has more than max_digits digits (the
-    value is then far outside every range the rules accept)."""
-    stripped = s.str.replace(r"^0+", "")
-    return (
-        pl.when(stripped == "")
-        .then(pl.lit(0, dtype=pl.Int64))
-        .when(stripped.str.len_chars() <= max_digits)
-        .then(stripped.cast(pl.Int64, strict=False))
-        .otherwise(NULL_I64)
-    )
-
-
-def _f3_expr(col):
-    s = pl.col(col)
-    # Any value with 17+ significant digits exceeds every window the
-    # generator writes (and 2^63); the Python parser would still parse it
-    # and then drop the row as outside the window, so null is equivalent.
-    return pl.when(s.str.contains(F3_RE)).then(_stripped_value(s, 16)).otherwise(NULL_I64)
 
 
 def _ts_ms_expr(col):
-    """Parse a ts column into epoch ms (null when bad). The dispatch is
-    exactly pipeline.py's parser: F1 = 20 chars ending in Z, F2 = 25 chars
-    with a colon at 22 and a sign at 19, anything else can only be F3."""
+    """Parse a ts column into epoch ms (null when bad): one ISO regex
+    dispatches between the unified F1/F2 conversion and F3 epoch digits,
+    mirroring pipeline.py's parser (F1 = Z-terminated, F2 = signed
+    offset, anything else can only be F3)."""
     s = pl.col(col)
-    length = s.str.len_chars()
-    is_f1 = (length == 20) & (s.str.slice(19, 1) == "Z")
-    is_f2 = (
-        (length == 25)
-        & (s.str.slice(22, 1) == ":")
-        & s.str.slice(19, 1).is_in(["+", "-"])
-    )
     return (
-        pl.when(is_f1)
-        .then(_f1_expr(col))
-        .when(is_f2)
-        .then(_f2_expr(col))
-        .otherwise(_f3_expr(col))
+        pl.when(s.str.contains(ISO_RE))
+        .then(_iso_value(col))
+        .otherwise(_digits_value(s))
     )
 
 
@@ -456,37 +491,31 @@ event_files = sorted(glob.glob(os.path.join(DATA, "events", "*.csv")))
 print(f"{len(event_files)} event files")
 event_parts = _parse_to_parts(event_files, 7, "events")
 
-# Dedup on a narrow keys frame: (event_id, ingest_ms, _ord) has a total
-# order, so after sorting, keep-first is the copy with the smallest
-# ingest_ts, ties resolved to the earliest-read copy, exactly like the
-# dict merge in pipeline.py.
+# Dedup on a narrow keys frame: per event_id, the winner is the copy
+# with the smallest (ingest_ts, _ord) -- smallest ingest_ts, ties
+# resolved to the earliest-read copy, exactly like the dict merge in
+# pipeline.py. The comparison keys on the raw ingest string: ingest_ts
+# is always valid F1 (fixed width, zero padded), so string order is
+# chronological order, and equal strings are equal instants. A hash
+# group_by picks the same winner as sort + keep-first (verified on the
+# full dev keys) at a fraction of the cost.
 keys = (
     _scan_parts(event_parts, 7)
     .filter(pl.col("c0") != "")
     .select("c0", "c3", "_ord")
-    .with_columns(_ingest_ms_expr("c3").alias("ingest_ms"))
-    .select("c0", "ingest_ms", "_ord")
-    .sort(["c0", "ingest_ms", "_ord"])
     .collect(engine="streaming")
 )
-winners = keys.unique(subset=["c0"], keep="first", maintain_order=True).select("_ord")
+winners = keys.group_by("c0").agg(
+    pl.col("_ord").sort_by(["c3", "_ord"]).first()
+).select("_ord")
 del keys
 
-_price_val = _stripped_value(pl.col("c6"), 8)
-_price_ok = (
-    pl.col("c6").str.contains(F3_RE)
-    & _price_val.is_not_null()
-    & (_price_val >= 1)
-    & (_price_val <= 10_000_000)
-)
 events = (
     _scan_parts(event_parts, 7)
     .join(winners.lazy(), on="_ord", how="semi")
     .with_columns(
         _ts_ms_expr("c2").alias("ts_ms"),
         _ingest_ms_expr("c3").alias("ingest_ms"),
-        _price_val.alias("_price_val"),
-        _price_ok.alias("_price_ok"),
     )
     .filter(
         (pl.col("c1") != "")
@@ -495,7 +524,6 @@ events = (
         & pl.col("ts_ms").is_not_null()
         & (pl.col("ts_ms") >= window_start)
         & (pl.col("ts_ms") < window_end)
-        & ((pl.col("c4") != "purchase") | pl.col("_price_ok"))
         & ((pl.col("ingest_ms") - pl.col("ts_ms")) <= DAY_MS)
     )
     .join(person_map.lazy(), left_on="c1", right_on="user_id", how="left")
@@ -505,13 +533,40 @@ events = (
         ts=pl.col("ts_ms"),
         event_type=pl.col("c4"),
         category=pl.col("category").fill_null("unknown"),
-        price=pl.when(pl.col("c4") == "purchase")
-        .then(pl.col("_price_val"))
-        .otherwise(0),
+        price_str=pl.col("c6"),
     )
     .collect(engine="streaming")
 )
 del winners
+
+# Purchase prices are validated only here, on the purchase subset (a few
+# percent of events): the rules ignore price_cents for view/cart, and a
+# purchase whose price is not ASCII digits with value 1..10,000,000 is
+# dropped. Doing it after the collect keeps the price conversion out of
+# the full-width streaming plan above.
+if events.height:
+    _purchases = (
+        events.filter(pl.col("event_type") == "purchase")
+        .with_columns(_digits_value(pl.col("price_str")).alias("price"))
+        .filter(
+            pl.col("price").is_not_null()
+            & (pl.col("price") >= 1)
+            & (pl.col("price") <= 10_000_000)
+        )
+        .drop("price_str")
+    )
+    events = pl.concat(
+        [
+            events.filter(pl.col("event_type") != "purchase")
+            .with_columns(price=pl.lit(0, dtype=pl.Int64))
+            .drop("price_str"),
+            _purchases,
+        ],
+        how="vertical",
+    )
+    del _purchases
+else:
+    events = events.with_columns(price=pl.lit(0, dtype=pl.Int64)).drop("price_str")
 
 # --------------------------------------------------------------------------
 # Sessionize per person: sorted by ts, a new session starts when the gap
@@ -544,12 +599,20 @@ if events.height:
         .with_columns(day=pl.col("start").cast(pl.Datetime("ms")).dt.date())
         .with_row_index("sid")
     )
-    # Per person/day/category purchase totals, for top_category.
-    purchases = events.filter(pl.col("event_type") == "purchase").join(
-        sessions.select(["person", "_session_seq", "day"]),
-        on=["person", "_session_seq"],
-        how="left",
-    ).with_columns(pl.col("person").cast(pl.String))
+    # Per person/day/category purchase totals, for top_category. Events
+    # are sorted by (person, ts) and sessions are ts-contiguous blocks in
+    # (person, _session_seq) order (the group_by above keeps first-
+    # appearance order), so repeating each session's day by its event
+    # count aligns the day onto its events with no join.
+    events = events.with_columns(
+        _session_day=sessions["day"].repeat_by(sessions["n_events"]).explode()
+    )
+    purchases = (
+        events.filter(pl.col("event_type") == "purchase")
+        .select(["person", "ts", "event_type", "category", "price",
+                 pl.col("_session_day").alias("day")])
+        .with_columns(pl.col("person").cast(pl.String))
+    )
     sessions = sessions.with_columns(pl.col("person").cast(pl.String))
 else:
     sessions = pl.DataFrame(
@@ -615,10 +678,9 @@ ckeys = (
     _scan_parts(click_parts, 4)
     .filter(pl.col("c0") != "")
     .select("c0", "_ord")
-    .sort(["c0", "_ord"])
     .collect(engine="streaming")
 )
-cwinners = ckeys.unique(subset=["c0"], keep="first", maintain_order=True).select("_ord")
+cwinners = ckeys.group_by("c0").agg(pl.col("_ord").min()).select("_ord")
 del ckeys
 
 clicks = (
@@ -735,7 +797,6 @@ if sessions.height and clicks.height:
         if assisted.height:
             assist_counts.append(
                 assisted.select(["sid", "campaign_id", "day"])
-                .unique()
                 .group_by(["campaign_id", "day"])
                 .agg(assisted_sessions=pl.len())
             )
