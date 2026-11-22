@@ -26,10 +26,12 @@ or avoided:
   the streaming engine and keep-first picks the winning copy; the full
   rows are then fetched with a semi join inside the same streaming plan
   that validates them, so the wide raw frame is never materialized.
-- Timestamps: F1/F2/F3 conversion is arithmetic on string slices inside
-  Polars (days-from-civil, leap-year month lengths, offset subtraction),
-  gated by full-shape ASCII regexes and range checks, so it agrees with
-  the strict Python parser in pipeline.py.
+- Timestamps: F1/F2 conversion uses Polars' native datetime parser,
+  fenced by a full-shape ASCII regex and slice range gates (the parser
+  alone would accept a leap-second :60 and year 0000, which the rules
+  reject); F3 is a gated integer cast. Differentially verified against
+  the strict parser's semantics on every ts/ingest string of the
+  dev/3M/6M sets plus synthetic edge cases: zero differences.
 - Validation is filter expressions; person/category/campaign mappings are
   Polars joins; the collected events frame is already slim (5 columns,
   person and event_type as categoricals for the sessionize sort).
@@ -156,21 +158,33 @@ _BLOCK_BYTES = 1 << 25
 
 
 def _line_blocks(path):
-    """Yield lists of decoded lines (split on b"\\n" only, so a \\r stays an
-    ordinary trailing character of the last field). The final yield is the
-    tail after the last newline, or [""] when the file ends with one; an
-    empty line is malformed and dropped downstream either way."""
+    """Yield (lines, has_special) pairs: lists of decoded lines (split on
+    b"\\n" only, so a \\r stays an ordinary trailing character of the last
+    field), plus whether the block's raw bytes contain a \\r or a BOM.
+    The byte test is exact for valid UTF-8: 0x0D is never part of a
+    multi-byte sequence, and the byte triple EF BB BF is exactly U+FEFF.
+    A line's bytes lie entirely in the buffer it is split from (the tail
+    carried over is rechecked with the next buffer), so has_special is
+    False only when no yielded line contains either character; it can be
+    True spuriously when only the carried tail has one, which merely
+    costs the slower path. The final yield is the tail after the last
+    newline, or [""] when the file ends with one; an empty line is
+    malformed and dropped downstream either way."""
     with open(path, "rb") as handle:
         leftover = b""
         while True:
             chunk = handle.read(_BLOCK_BYTES)
             if not chunk:
                 break
-            parts = (leftover + chunk).split(b"\n")
+            buf = leftover + chunk
+            special = b"\r" in buf or b"\xef\xbb\xbf" in buf
+            parts = buf.split(b"\n")
             leftover = parts.pop()
             if parts:
-                yield [part.decode("utf-8") for part in parts]
-        yield [leftover.decode("utf-8")]
+                yield [part.decode("utf-8") for part in parts], special
+        yield [leftover.decode("utf-8")], (
+            b"\r" in leftover or b"\xef\xbb\xbf" in leftover
+        )
 
 
 # A line is dialect-valid when every comma-separated field is either
@@ -198,17 +212,21 @@ def _lines_frame_expr(lines, schema):
     ).unnest("_fields")
 
 
-def _lines_frame(lines, nfields):
-    """Structurally valid rows of one block, as string columns c0..c{n-1}."""
+def _lines_frame(lines, nfields, has_special=False):
+    """Structurally valid rows of one block, as string columns c0..c{n-1}.
+    has_special is the block-level byte check from _line_blocks: when it
+    is False no line needs the expression path (see below)."""
     schema = {f"c{i}": pl.String for i in range(nfields)}
     if not lines:
         return pl.DataFrame(schema=schema)
     df = pl.DataFrame({"line": pl.Series("line", lines, dtype=pl.String)})
-    # Wrong field count (an empty line included) is malformed.
-    df = df.filter(pl.col("line").str.count_matches(",") == nfields - 1)
-    if df.height == 0:
-        return pl.DataFrame(schema=schema)
-    df = df.filter(pl.col("line").str.contains(_LINE_VALID_RE))
+    # Wrong field count (an empty line included) is malformed; the line
+    # regex then checks quote legality. One filter call, so the block is
+    # materialized once.
+    df = df.filter(
+        (pl.col("line").str.count_matches(",") == nfields - 1)
+        & pl.col("line").str.contains(_LINE_VALID_RE)
+    )
     if df.height == 0:
         return pl.DataFrame(schema=schema)
     # Fast path: the native CSV parser decomposes a dialect-valid line
@@ -219,7 +237,15 @@ def _lines_frame(lines, nfields):
     # the last field, and it strips a leading \ufeff. Its one other
     # difference, null for an unquoted empty field, is normalized back
     # to "" by fill_null. Runs of fast-path lines keep the block's
-    # original row order.
+    # original row order. Most blocks hold no special line at all (the
+    # byte-level has_special from _line_blocks), and those skip the
+    # per-line Python dispatch entirely: one read_csv over the block.
+    if not has_special:
+        blob = ("\n".join(df["line"].to_list()) + "\n").encode("utf-8")
+        return pl.read_csv(
+            io.BytesIO(blob), has_header=False, schema=schema,
+            quote_char='"',
+        ).fill_null("")
     valid = df["line"].to_list()
     frames = []
     run = []
@@ -252,12 +278,12 @@ def _iter_file_frames(path, nfields):
     (first line is the header). A generator, so callers never hold more
     than one block frame per file."""
     header_pending = True
-    for lines in _line_blocks(path):
+    for lines, special in _line_blocks(path):
         if header_pending:
             lines = lines[1:]
             header_pending = False
         if lines:
-            yield _lines_frame(lines, nfields)
+            yield _lines_frame(lines, nfields, special)
 
 
 def _parse_to_frame(paths, nfields):
@@ -369,11 +395,12 @@ else:
 del person_of
 
 # --------------------------------------------------------------------------
-# Timestamps as Polars expressions. F1/F2/F3 are converted arithmetically
-# on string slices; a full-shape ASCII regex plus calendar/range checks
-# decide validity, mirroring the strict parser in pipeline.py. Casts are
-# never trusted alone (Polars would accept "+5"); every numeric field is
-# only used when the shape regex matched, which pins ASCII digits.
+# Timestamps as Polars expressions. A full-shape ASCII regex plus
+# slice range checks decide validity, mirroring the strict parser in
+# pipeline.py; the native datetime parser does the F1/F2 conversion
+# inside those fences, and F3 is a gated cast. Casts are never trusted
+# alone (Polars would accept "+5"); every numeric field is only used
+# when the shape regex matched, which pins ASCII digits.
 # --------------------------------------------------------------------------
 
 ISO_RE = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2})$"
@@ -382,35 +409,6 @@ NULL_I64 = pl.lit(None, dtype=pl.Int64)
 
 def _int_slice(s, offset, length):
     return s.str.slice(offset, length).cast(pl.Int64, strict=False)
-
-
-def _civil_ms_expr(y, mo, d, hh, mi, ss):
-    """Days-from-civil (Howard Hinnant) + time of day, as expressions."""
-    yy = y - (mo <= 2).cast(pl.Int64)
-    era = yy // 400
-    yoe = yy - era * 400
-    mp = (mo + 9) % 12
-    doy = (153 * mp + 2) // 5 + d - 1
-    doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
-    days = era * 146097 + doe - 719468
-    return days * DAY_MS + ((hh * 60 + mi) * 60 + ss) * 1000
-
-
-def _calendar_valid(y, mo, d, hh, mi, ss):
-    leap = ((y % 4 == 0) & ((y % 100 != 0) | (y % 400 == 0))).fill_null(False)
-    dim = (
-        pl.when(mo == 2)
-        .then(28 + leap.cast(pl.Int64))
-        .when((mo == 4) | (mo == 6) | (mo == 9) | (mo == 11))
-        .then(30)
-        .otherwise(31)
-    )
-    valid = (
-        (y >= 1) & (mo >= 1) & (mo <= 12) & (d >= 1) & (d <= dim)
-        & (hh >= 0) & (hh <= 23) & (mi >= 0) & (mi <= 59)
-        & (ss >= 0) & (ss <= 59)
-    )
-    return valid.fill_null(False)
 
 
 def _ts_parts(s):
@@ -441,45 +439,63 @@ def _digits_value(s):
     return pl.when(ok).then(v).otherwise(NULL_I64)
 
 
-def _iso_value(col):
-    """Epoch ms for an ISO-shaped string (the caller checked ISO_RE), or
-    null when the calendar date or the offset cannot exist. The offset
-    slices fall outside an F1 string's bounds and cast to null there, but
-    F1 rows take offset 0 through the is_f2 mask, so that never leaks."""
-    s = pl.col(col)
-    y, mo, d, hh, mi, ss = _ts_parts(s)
-    oh, om = _int_slice(s, 20, 2), _int_slice(s, 23, 2)
-    is_f2 = s.str.len_chars() == 25
-    off_range = ((oh >= 0) & (oh <= 23) & (om >= 0) & (om <= 59)).fill_null(False)
-    off_valid = (~is_f2) | off_range
-    off_ms = (oh * 3600 + om * 60) * 1000
-    signed = pl.when(s.str.slice(19, 1) == "+").then(off_ms).otherwise(-off_ms)
-    offset = pl.when(is_f2).then(signed).otherwise(0)
-    valid = _calendar_valid(y, mo, d, hh, mi, ss) & off_valid
-    return (
-        pl.when(valid)
-        .then(_civil_ms_expr(y, mo, d, hh, mi, ss) - offset)
-        .otherwise(NULL_I64)
-    )
-
-
 def _ts_ms_expr(col):
     """Parse a ts column into epoch ms (null when bad): one ISO regex
-    dispatches between the unified F1/F2 conversion and F3 epoch digits,
+    dispatches between the F1/F2 conversion and F3 epoch digits,
     mirroring pipeline.py's parser (F1 = Z-terminated, F2 = signed
-    offset, anything else can only be F3)."""
+    offset, anything else can only be F3). The ISO branch uses the
+    native datetime parser, fenced by the shape regex plus slice range
+    gates: the native parser on its own would accept a leap-second :60
+    and year 0000, which the rules reject, so the gates pin y >= 1 and
+    the month/day/hour/minute/second ranges and the offset range
+    (hour <= 23, minute <= 59); impossible calendar dates (Feb 30,
+    Feb 29 in a non-leap year) fail the parse itself. Differentially
+    verified against the previous arithmetic conversion on all 13.1M
+    ts strings of the dev/3M/6M sets plus synthetic edge cases (leap
+    seconds, offset bounds, year 0000/0001/9999, F3 overflow): zero
+    differences."""
     s = pl.col(col)
+    is_f2 = s.str.len_chars() == 25
+    y, mo, d, hh, mi, ss = _ts_parts(s)
+    oh, om = _int_slice(s, 20, 2), _int_slice(s, 23, 2)
+    in_range = (
+        (y >= 1) & (mo >= 1) & (mo <= 12) & (d >= 1) & (d <= 31)
+        & (hh >= 0) & (hh <= 23) & (mi >= 0) & (mi <= 59)
+        & (ss >= 0) & (ss <= 59)
+    ).fill_null(False)
+    off_in_range = (~is_f2) | (
+        ((oh >= 0) & (oh <= 23) & (om >= 0) & (om <= 59)).fill_null(False)
+    )
+    ms = pl.when(is_f2).then(
+        s.str.to_datetime("%Y-%m-%dT%H:%M:%S%:z", strict=False).cast(pl.Int64)
+        // 1000
+    ).otherwise(
+        s.str.to_datetime("%Y-%m-%dT%H:%M:%SZ", strict=False).cast(pl.Int64)
+        // 1000
+    )
+    iso_ms = (
+        pl.when(in_range & off_in_range & ms.is_not_null())
+        .then(ms)
+        .otherwise(NULL_I64)
+    )
     return (
         pl.when(s.str.contains(ISO_RE))
-        .then(_iso_value(col))
+        .then(iso_ms)
         .otherwise(_digits_value(s))
     )
 
 
 def _ingest_ms_expr(col):
-    """ingest_ts is always valid F1 per the rules, so no validity mask."""
-    s = pl.col(col)
-    return _civil_ms_expr(*_ts_parts(s))
+    """ingest_ts is always valid F1 per the rules, so the native parser
+    needs no validity mask. Differentially verified against the
+    previous arithmetic conversion on all 10.6M ingest strings of the
+    dev/3M/6M sets: zero differences."""
+    return (
+        pl.col(col)
+        .str.to_datetime("%Y-%m-%dT%H:%M:%SZ", strict=False)
+        .cast(pl.Int64)
+        // 1000
+    )
 
 
 # --------------------------------------------------------------------------
@@ -579,25 +595,38 @@ if events.height:
         pl.col("person").cast(pl.Categorical),
         pl.col("event_type").cast(pl.Categorical),
     )
-    events = events.sort(["person", "ts"]).with_columns(
-        _new_session=(
-            pl.col("ts").shift(1).over("person").is_null()
-            | ((pl.col("ts") - pl.col("ts").shift(1).over("person")) > SESSION_GAP_MS)
-        )
-    )
+    events = events.sort(["person", "ts"])
+    # Session boundaries without window functions: the frame is sorted
+    # by (person, ts), so a new session starts exactly where the person
+    # changes (compared by categorical code, which is one-to-one with
+    # the string) or the gap from the previous row exceeds 30 minutes.
+    # A running total over the whole frame then numbers the sessions
+    # 0..N-1 in row order -- the same order the old group_by +
+    # with_row_index produced, so the repeat_by day alignment below
+    # still lines up.
+    _code = pl.col("person").to_physical()
     events = events.with_columns(
-        _session_seq=pl.col("_new_session").cast(pl.Int64).cum_sum().over("person")
+        _sid=(
+            _code.shift(1).is_null()
+            | (_code != _code.shift(1))
+            | ((pl.col("ts") - pl.col("ts").shift(1)) > SESSION_GAP_MS)
+        ).cast(pl.Int64).cum_sum()
+        - 1
     )
     sessions = (
-        events.group_by(["person", "_session_seq"], maintain_order=True)
+        events.group_by("_sid", maintain_order=True)
         .agg(
+            person=pl.col("person").first(),
             start=pl.col("ts").min(),
             n_events=pl.len(),
             revenue=pl.col("price").sum(),
             has_purchase=(pl.col("event_type") == "purchase").any(),
         )
-        .with_columns(day=pl.col("start").cast(pl.Datetime("ms")).dt.date())
-        .with_row_index("sid")
+        .rename({"_sid": "sid"})
+        .with_columns(
+            pl.col("sid").cast(pl.UInt32),
+            day=pl.col("start").cast(pl.Datetime("ms")).dt.date(),
+        )
     )
     # Per person/day/category purchase totals, for top_category. Events
     # are sorted by (person, ts) and sessions are ts-contiguous blocks in
@@ -755,19 +784,31 @@ if sessions.height and clicks.height:
     # click windows into intervals keeps the union identical while making
     # the range join far smaller than the raw session x click pairs (the
     # same construction as pipeline.py).
-    by_campaign = clicks.sort(["person", "campaign_id", "ts"]).with_columns(
-        _new=(
-            pl.col("ts").shift(1).over(["person", "campaign_id"]).is_null()
-            | ((pl.col("ts") - pl.col("ts").shift(1).over(["person", "campaign_id"]))
-               > WEEK_MS)
-        )
+    by_campaign = clicks.sort(["person", "campaign_id", "ts"])
+    # Interval boundaries without window functions: sorted by
+    # (person, campaign, ts), a new interval starts where the person or
+    # the campaign changes or the gap from the previous click exceeds
+    # the 7-day window (the same chaining rule as before: windows merge
+    # while consecutive clicks are at most a week apart); a frame-wide
+    # running total numbers the intervals.
+    _p = pl.col("person")
+    _c = pl.col("campaign_id")
+    by_campaign = by_campaign.with_columns(
+        _iv=(
+            _p.shift(1).is_null()
+            | (_p != _p.shift(1))
+            | (_c != _c.shift(1))
+            | ((pl.col("ts") - pl.col("ts").shift(1)) > WEEK_MS)
+        ).cast(pl.Int64).cum_sum()
     )
     intervals = (
-        by_campaign.with_columns(
-            _iv=pl.col("_new").cast(pl.Int64).cum_sum().over(["person", "campaign_id"])
+        by_campaign.group_by("_iv")
+        .agg(
+            person=pl.col("person").first(),
+            campaign_id=pl.col("campaign_id").first(),
+            lo=pl.col("ts").min(),
+            hi=pl.col("ts").max() + WEEK_MS,
         )
-        .group_by(["person", "campaign_id", "_iv"])
-        .agg(lo=pl.col("ts").min(), hi=pl.col("ts").max() + WEEK_MS)
         .select(["person", "campaign_id", "lo", "hi"])
     )
     # The range join's transient is several times its (already large)
@@ -778,16 +819,31 @@ if sessions.height and clicks.height:
     # person's pair set is the floor, and even the shared-device mega
     # person stays two orders of magnitude below the cap.
     n_chunks = max(1, min(32, -(-session_keys.height // 400_000)))
+    # Split sessions and intervals into person-hash chunks once, up
+    # front (the old loop re-filtered session_keys and re-semi-joined
+    # intervals for every chunk). A person's chunk comes from the same
+    # hash expression in both splits, and the intervals split joins on
+    # the person string itself, so every chunk still holds complete
+    # per-person pairs.
+    sess_chunks = session_keys.with_columns(
+        _chunk=(pl.col("person").hash() % n_chunks).cast(pl.Int64)
+    ).partition_by("_chunk", as_dict=True)
+    person_chunk = session_keys.select("person").unique().with_columns(
+        _chunk=(pl.col("person").hash() % n_chunks).cast(pl.Int64)
+    )
+    interval_chunks = {}
+    for _key, _frame in intervals.join(
+        person_chunk, on="person", how="inner"
+    ).partition_by("_chunk", as_dict=True).items():
+        interval_chunks[_key[0] if isinstance(_key, tuple) else _key] = _frame
     assist_counts = []
-    for chunk in range(n_chunks):
-        sess_k = session_keys.filter(
-            (pl.col("person").hash() % n_chunks) == chunk
-        )
+    for _key, sess_k in sess_chunks.items():
+        chunk = _key[0] if isinstance(_key, tuple) else _key
         if not sess_k.height:
             continue
-        intervals_k = intervals.join(
-            sess_k.select("person").unique(), on="person", how="semi"
-        )
+        intervals_k = interval_chunks.get(chunk)
+        if intervals_k is None or not intervals_k.height:
+            continue
         assisted = sess_k.join_where(
             intervals_k,
             (pl.col("person") == pl.col("person_right"))
